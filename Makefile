@@ -3,12 +3,24 @@ OBJS	= src/main.o
 LIBS	= -lSceSysmemForDriver_stub -lSceThreadmgrForDriver_stub \
 	-lSceCpuForDriver_stub -lSceUdcdForDriver_stub \
 	-lSceDisplayForDriver_stub -lSceIftuForDriver_stub \
-	-ltaihenForKernel_stub
+	-ltaihenForKernel_stub -lSceSysclibForDriver_stub
 
 ifeq ($(DEBUG), 1)
 	OBJS	+= debug/log.o debug/draw.o debug/console.o debug/font_data.o
 	CFLAGS	+= -DDEBUG -Idebug
-	LIBS	+= -lSceSysclibForDriver_stub -lSceIofilemgrForDriver_stub
+	LIBS	+= -lSceIofilemgrForDriver_stub
+endif
+
+ifeq ($(DIAG), 1)
+	OBJS	+= src/diag.o
+	CFLAGS	+= -DDIAG
+	LIBS	+= -lSceIofilemgrForDriver_stub
+endif
+
+# Diagnostic only: ignore the host-negotiated frame index and always send
+# the native 960x544 mode. Do not ship a build with this enabled.
+ifeq ($(FORCE_NATIVE_RES), 1)
+	CFLAGS	+= -DFORCE_NATIVE_RES
 endif
 
 ifeq ($(DISPLAY_OFF_OLED), 1)
@@ -23,7 +35,7 @@ endif
 
 PREFIX	= arm-vita-eabi
 CC	= $(PREFIX)-gcc
-CFLAGS	+= -Wl,-q -Wall -O2 -nostartfiles -mcpu=cortex-a9 -mthumb-interwork -Iinclude
+CFLAGS	+= -std=gnu17 -Wl,-q -Wall -O2 -nostartfiles -mcpu=cortex-a9 -mthumb-interwork -Iinclude
 DEPS	= $(OBJS:.o=.d)
 
 all: $(TARGET).skprx

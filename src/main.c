@@ -9,6 +9,7 @@
 #include <string.h>
 #include "usb_descriptors.h"
 #include "uvc.h"
+#include "diag.h"
 
 #ifdef DEBUG
 
@@ -627,8 +628,15 @@ static int frame_convert_to_nv12(int fid, const SceDisplayFrameBufInfo *fb_info,
 	src.unk28 = 0;
 	src.src_w = (src_width * 0x10000) / dst_width;
 	src.src_h = (src_height * 0x10000) / dst_height;
-	src.dst_x = 245760/512 - src_width/512;
-	src.dst_y = 139264/512 - src_height/512;
+	/*
+	 * src_w/src_h already scale the source to fill the whole negotiated
+	 * frame, so the blit must start at the origin of the destination
+	 * buffer. A non-zero dst_x/dst_y here shifts the image out of the
+	 * buffer and the IFTU clips whatever no longer fits, which is what
+	 * makes the host show only the top-left corner of the Vita screen.
+	 */
+	src.dst_x = 0;
+	src.dst_y = 0;
 	src.src_x = 0;
 	src.src_y = 0;
 	src.crop_top = 0;
@@ -645,6 +653,32 @@ static int frame_convert_to_nv12(int fid, const SceDisplayFrameBufInfo *fb_info,
 	dst.leftover_align = 0;
 	dst.paddr0 = dst_paddr;
 	dst.paddr1 = dst_paddr + dst_width * dst_height;
+
+#ifdef DIAG
+	{
+		/* Only log when the geometry actually changes, so streaming
+		 * doesn't turn into one file write per frame. */
+		static unsigned int last_sig;
+		unsigned int sig = src_width ^ (src_height << 8) ^ (src_pitch << 16) ^
+				   ((unsigned int)dst_width << 4) ^ ((unsigned int)dst_height << 20);
+
+		if (sig != last_sig) {
+			last_sig = sig;
+			DIAG_STEPN("csc.src w/h/pitch/bpp/fmt",
+				src_width, src_height, src_pitch,
+				src_pixelfmt_bpp, src_pixelfmt);
+			DIAG_STEPN("csc.src aligned_w/leftover_stride",
+				src_width_aligned, src.fb.leftover_stride);
+			DIAG_STEPN("csc.dst w/h/plane0_bytes/plane1_off",
+				dst_width, dst_height,
+				dst_width * dst_height,
+				dst_width * dst_height);
+			DIAG_STEPN("csc.scale src_w/src_h (16.16)",
+				src.src_w, src.src_h);
+			DIAG_STEPN("csc.dst_x/dst_y", src.dst_x, src.dst_y);
+		}
+	}
+#endif
 
 	return ksceIftuCsc(&dst, (SceIftuPlaneState *)&src, &params);
 }
@@ -699,13 +733,22 @@ static int send_frame(void)
 		const struct UVC_FRAME_UNCOMPRESSED(2) *frames =
 			video_streaming_descriptors.frames_uncompressed_nv12;
 		int cur_frame_index = uvc_probe_control_setting.bFrameIndex;
+#ifdef FORCE_NATIVE_RES
+		/*
+		 * Diagnostic build only: ignore whatever the host negotiated
+		 * and always emit frame index 1 (960x544). Never enable this
+		 * in a release build -- the host still expects the resolution
+		 * it committed to, so anything but 960x544 will look wrong.
+		 */
+		cur_frame_index = 1;
+#endif
 		int dst_width = frames[cur_frame_index - 1].wWidth;
 		int dst_height = frames[cur_frame_index - 1].wHeight;
 
 		static int last_frame_index = 0;
 		if (uvc_frame_buffer_uid < 0 || cur_frame_index != last_frame_index) {
 			uvc_frame_term();
-			ret = uvc_frame_init(UVC_FRAME_PADDING_SIZE + VIDEO_FRAME_SIZE_NV12(dst_width, dst_height));
+			ret = uvc_frame_init(__builtin_offsetof(struct uvc_frame, data) + VIDEO_FRAME_SIZE_NV12(dst_width, dst_height));
 			if (ret < 0) {
 				LOG("Error allocating the UVC frame (0x%08X)\n", ret);
 				return ret;
@@ -713,6 +756,39 @@ static int send_frame(void)
 				last_frame_index = cur_frame_index;
 			}
 		}
+
+#ifdef DIAG
+		{
+			static int diag_last_index = -1;
+
+			if (cur_frame_index != diag_last_index) {
+				diag_last_index = cur_frame_index;
+				DIAG_STEPN("neg.bFormatIndex/bFrameIndex",
+					uvc_probe_control_setting.bFormatIndex,
+					uvc_probe_control_setting.bFrameIndex);
+				DIAG_STEPN("neg.width/height", dst_width, dst_height);
+				DIAG_STEPN("neg.dwFrameInterval",
+					uvc_probe_control_setting.dwFrameInterval);
+				DIAG_STEPN("frame.expected_nv12_bytes",
+					VIDEO_FRAME_SIZE_NV12(dst_width, dst_height));
+				DIAG_STEPN("frame.transmitted_bytes(hdr+data)",
+					UVC_PAYLOAD_SIZE(VIDEO_FRAME_SIZE_NV12(dst_width, dst_height)));
+				DIAG_STEPN("desc.dwMaxVideoFrameBufferSize",
+					frames[cur_frame_index - 1].dwMaxVideoFrameBufferSize);
+				DIAG_STEPN("probe.dwMaxVideoFrameSize/dwMaxPayloadTransferSize",
+					uvc_probe_control_setting.dwMaxVideoFrameSize,
+					uvc_probe_control_setting.dwMaxPayloadTransferSize);
+				DIAG_STEPN("fb.width/height/pitch/pixelformat",
+					fb_info.framebuf.width, fb_info.framebuf.height,
+					fb_info.framebuf.pitch, fb_info.framebuf.pixelformat);
+				DIAG_STEPN("alloc.requested_bytes",
+					UVC_FRAME_PADDING_SIZE + VIDEO_FRAME_SIZE_NV12(dst_width, dst_height));
+				DIAG_STEPN("alloc.required_bytes(offsetof data + frame)",
+					(int)__builtin_offsetof(struct uvc_frame, data) +
+					VIDEO_FRAME_SIZE_NV12(dst_width, dst_height));
+			}
+		}
+#endif
 
 		ret = convert_and_send_frame_nv12(fid, &fb_info, dst_width, dst_height);
 		if (ret < 0) {
@@ -774,7 +850,11 @@ static int uvc_thread(SceSize args, void *argp)
 #endif
 
 	stream = 0;
-	uvc_start();
+	DIAG_STEP("uvc_thread.entry", 0);
+
+	int start_ret = uvc_start();
+	DIAG_STEP("uvc_start.result", start_ret);
+	UNUSED(start_ret);
 
 	display_vblank_cb_uid = ksceKernelCreateCallback("uvc_display_vblank", 0,
 							 display_vblank_cb_func, NULL);
@@ -861,6 +941,7 @@ int uvc_start(void)
 	 * Wait until there's a framebuffer set.
 	 */
 	ksceDisplayWaitSetFrameBufCB();
+	DIAG_STEP("ksceDisplayWaitSetFrameBufCB.done", 0);
 
 #ifndef DEBUG
 	/*
@@ -870,6 +951,7 @@ int uvc_start(void)
 #endif
 
 	ret = ksceUdcdDeactivate();
+	DIAG_STEP("ksceUdcdDeactivate", ret);
 	if (ret < 0 && ret != SCE_UDCD_ERROR_INVALID_ARGUMENT) {
 		LOG("Error deactivating UDCD (0x%08X)\n", ret);
 		return ret;
@@ -881,24 +963,28 @@ int uvc_start(void)
 	ksceUdcdStop("USBDeviceControllerDriver", 0, NULL);
 
 	ret = ksceUdcdStart("USBDeviceControllerDriver", 0, NULL);
+	DIAG_STEP("ksceUdcdStart(USBDeviceControllerDriver)", ret);
 	if (ret < 0) {
 		LOG("Error starting the USBDeviceControllerDriver driver (0x%08X)\n", ret);
 		return ret;
 	}
 
 	ret = ksceUdcdStart(UVC_DRIVER_NAME, 0, NULL);
+	DIAG_STEP("ksceUdcdStart(VITAUVC00)", ret);
 	if (ret < 0) {
 		LOG("Error starting the " UVC_DRIVER_NAME " driver (0x%08X)\n", ret);
 		goto err_start_uvc_driver;
 	}
 
 	ret = ksceUdcdActivate(UVC_USB_PID);
+	DIAG_STEP("ksceUdcdActivate", ret);
 	if (ret < 0) {
 		LOG("Error activating the " UVC_DRIVER_NAME " driver (0x%08X)\n", ret);
 		goto err_activate;
 	}
 
 	ret = uvc_frame_req_init();
+	DIAG_STEP("uvc_frame_req_init", ret);
 	if (ret < 0) {
 		LOG("Error allocating USB request (0x%08X)\n", ret);
 		goto err_alloc_uvc_frame_req;
@@ -981,17 +1067,23 @@ int module_start(SceSize argc, const void *args)
 
 	LOG("udcd_uvc by xerpi\n");
 
+	DIAG_RESET();
+	DIAG_STEP("module_start.entry", 0);
+
 	SceUdcd_modinfo.size = sizeof(SceUdcd_modinfo);
-	taiGetModuleInfoForKernel(KERNEL_PID, "SceUdcd", &SceUdcd_modinfo);
+	ret = taiGetModuleInfoForKernel(KERNEL_PID, "SceUdcd", &SceUdcd_modinfo);
+	DIAG_STEP("taiGetModuleInfoForKernel(SceUdcd)", ret);
 
 	SceUdcd_sub_01E1128C_hook_uid = taiHookFunctionOffsetForKernel(KERNEL_PID,
 		&SceUdcd_sub_01E1128C_ref, SceUdcd_modinfo.modid, 0,
 		0x01E1128C - 0x01E10000, 1, SceUdcd_sub_01E1128C_hook_func);
+	DIAG_STEP("taiHookFunctionOffsetForKernel", SceUdcd_sub_01E1128C_hook_uid);
 
 	uvc_thread_id = ksceKernelCreateThread("uvc_thread", uvc_thread,
 					       0x3C, 0x1000, 0, 0x10000, 0);
 	if (uvc_thread_id < 0) {
 		LOG("Error creating the UVC thread (0x%08X)\n", uvc_thread_id);
+		DIAG_STEP("ksceKernelCreateThread.FAIL", uvc_thread_id);
 		goto err_return;
 	}
 
@@ -999,10 +1091,12 @@ int module_start(SceSize argc, const void *args)
 						      0, NULL);
 	if (uvc_event_flag_id < 0) {
 		LOG("Error creating the UVC event flag (0x%08X)\n", uvc_event_flag_id);
+		DIAG_STEP("ksceKernelCreateEventFlag.FAIL", uvc_event_flag_id);
 		goto err_destroy_thread;
 	}
 
 	ret = ksceUdcdRegister(&uvc_udcd_driver);
+	DIAG_STEP("ksceUdcdRegister", ret);
 	if (ret < 0) {
 		LOG("Error registering the UDCD driver (0x%08X)\n", ret);
 		goto err_delete_event_flag;
@@ -1011,10 +1105,13 @@ int module_start(SceSize argc, const void *args)
 	uvc_thread_run = 1;
 
 	ret = ksceKernelStartThread(uvc_thread_id, 0, NULL);
+	DIAG_STEP("ksceKernelStartThread", ret);
 	if (ret < 0) {
 		LOG("Error starting the UVC thread (0x%08X)\n", ret);
 		goto err_unregister;
 	}
+
+	DIAG_STEP("module_start.SUCCESS", 0);
 
 	return SCE_KERNEL_START_SUCCESS;
 
@@ -1025,6 +1122,7 @@ err_delete_event_flag:
 err_destroy_thread:
 	ksceKernelDeleteThread(uvc_thread_id);
 err_return:
+	DIAG_STEP("module_start.FAILED", 0);
 	return SCE_KERNEL_START_FAILED;
 }
 

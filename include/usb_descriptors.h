@@ -453,3 +453,45 @@ struct SceUdcdConfiguration config_full = {
 	&interdesc_full[0],
 	&endpdesc_full[0]
 };
+
+/*
+ * Compile-time verification that every USB/UVC descriptor has the exact
+ * on-the-wire size mandated by the UVC 1.1 spec. GCC 15 is much newer than
+ * the compiler this code was written for, so make the layout assumptions
+ * explicit instead of trusting __attribute__((packed)) to still behave.
+ */
+
+_Static_assert(sizeof(struct uvc_streaming_control) == 34,
+	"uvc_streaming_control must be 34B (UVC 1.1 probe/commit control)");
+
+_Static_assert(sizeof(interface_association_descriptor) == UVC_INTERFACE_ASSOCIATION_DESC_SIZE,
+	"IAD must be 8B");
+
+_Static_assert(sizeof(video_control_descriptors.header_descriptor) == UVC_DT_HEADER_SIZE(1),
+	"VC header descriptor must be 13B");
+_Static_assert(sizeof(struct uvc_input_terminal_descriptor) == UVC_DT_INPUT_TERMINAL_SIZE,
+	"Input terminal descriptor must be 8B");
+_Static_assert(sizeof(struct uvc_output_terminal_descriptor) == UVC_DT_OUTPUT_TERMINAL_SIZE,
+	"Output terminal descriptor must be 9B");
+_Static_assert(sizeof(video_control_descriptors) == 30,
+	"VideoControl descriptor block must be 30B");
+
+_Static_assert(sizeof(video_streaming_descriptors.input_header_descriptor) == UVC_DT_INPUT_HEADER_SIZE(1, 1),
+	"VS input header descriptor must be 14B");
+_Static_assert(sizeof(struct uvc_format_uncompressed) == UVC_DT_FORMAT_UNCOMPRESSED_SIZE,
+	"Uncompressed format descriptor must be 27B");
+_Static_assert(sizeof(struct UVC_FRAME_UNCOMPRESSED(2)) == UVC_DT_FRAME_UNCOMPRESSED_SIZE(2),
+	"Uncompressed frame descriptor (2 intervals) must be 34B");
+_Static_assert(sizeof(video_streaming_descriptors.frames_uncompressed_nv12) == 5 * UVC_DT_FRAME_UNCOMPRESSED_SIZE(2),
+	"Frame descriptor array must be tightly packed (5 x 34B)");
+_Static_assert(sizeof(struct uvc_color_matching_descriptor) == UVC_DT_COLOR_MATCHING_SIZE,
+	"Color matching descriptor must be 6B");
+_Static_assert(sizeof(video_streaming_descriptors) == 217,
+	"VideoStreaming descriptor block must be 217B");
+
+/*
+ * The frame descriptor array is indexed as frames[bFrameIndex - 1] at runtime,
+ * which is only valid while every element has an identical stride.
+ */
+_Static_assert(sizeof(video_streaming_descriptors.frames_uncompressed_nv12[0]) == 34,
+	"Frame descriptor stride must be 34B for frames[bFrameIndex - 1] indexing");
